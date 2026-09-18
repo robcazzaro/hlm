@@ -71,5 +71,6 @@ In the library, there is also functionality to save settings (including the PEQ 
 The OLED screen shows the volume, the mute/unmute status and two VU bars on the side. There's no guarantee that the left VU shows the data from the left speaker (but a VU bar always shows the same speaker). Also, the current code handles more than 2 speakers, but the VU bars will only show the first 2 enumerated speakers. The VU scaling has been eyeballed, so it might need adjustments. When in mute (button press), the UI will show "Mute". When the system is in standby, the screen is off but, just like the OEM hub, it keeps sending messages. If the speakers stop receiving music for more than 30 seconds, the screen will go off and the device will go into "ISS mode" to let the speakers go into ISS on their own. When the music restarts, the speakers will turn on but the device won't. Any action (encoder rotation, button press) will wake up the device
 
 <br>
+
 *This file is part of the Homebrew Loudspeaker Manager distribution (https://github.com/obcazzaro/hlm).<br>
 Copyright (c) 2026 Rob Cazzaro.*
