@@ -72,5 +72,5 @@ The OLED screen shows the volume, the mute/unmute status and two VU bars on the 
 
 <br>
 
-*This file is part of the Homebrew Loudspeaker Manager distribution (https://github.com/obcazzaro/hlm).<br>
+*This file is part of the Homebrew Loudspeaker Manager distribution (https://github.com/robcazzaro/hlm).<br>
 Copyright (c) 2026 Rob Cazzaro.*

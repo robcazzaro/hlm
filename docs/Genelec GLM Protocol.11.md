@@ -1,4 +1,4 @@
-*This file is part of the Homebrew Loudspeaker Manager distribution (https://github.com/obcazzaro/hlm).<br>
+*This file is part of the Homebrew Loudspeaker Manager distribution (https://github.com/robcazzaro/hlm).<br>
 Copyright (c) 2026 Rob Cazzaro.*<br><br>
 
 # Genelec GLM Telemetry & Control Protocol Specification
