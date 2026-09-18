@@ -1,0 +1,9 @@
+{
+  "idf.extensionActivationMode": "always",
+  "idf.openOcdConfigs": ["board/esp32s3-builtin.cfg"],
+  "idf.customExtraVars": { "IDF_TARGET": "esp32s3" },
+  "idf.flashType": "UART",
+  "idf.portWin": "COM5",
+  "idf.monitorPort": "COM5",
+  "idf.currentSetup": "C:\\esp\\v6.0.2\\esp-idf"
+}
