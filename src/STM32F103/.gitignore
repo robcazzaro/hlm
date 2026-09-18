@@ -1,0 +1,5 @@
+build
+mx.scratch
+!.settings
+**/build/
+build/

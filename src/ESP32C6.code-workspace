@@ -1,0 +1,16 @@
+{
+    "folders": [
+        { "path": "ESP32C6" },
+        { "path": "HLM" },
+        { "path": "ESP32Common" }
+    ],
+    "settings": {
+        "C_Cpp.intelliSenseEngine": "disabled",
+        "C_Cpp.autocomplete": "disabled",
+        "clangd.arguments": [
+            "--background-index",
+            "--query-driver=**",
+            "--compile-commands-dir=../ESP32C6/build"
+        ]
+    }
+}
