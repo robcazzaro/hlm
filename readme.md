@@ -13,9 +13,11 @@ Welcome to the HLM documentation. The goal of this project is to enable limited 
 * The main goal of this project is to enable volume control (including mute and standby) of speakers not continuously connected to a GLM. If you own Genelec speakers, you owe it to yourself to get a GLM Calibration kit to get the best from your system. If you have multiple speakers in separate rooms, the HLM will allow you to control your speakers independently.
 <br>
 
-The GLM RS485 protocol has been reverse engineered with the help of LLMs, and I created a [GLM protocol spec](https://github.com/robcazzaro/hlm/blob/main/Genelec%20GLM%20Protocol.md).<br>
+The GLM RS485 protocol has been reverse engineered with the help of LLMs, and I created a [GLM protocol spec](https://github.com/robcazzaro/hlm/blob/main/Genelec%20GLM%20Protocol.12.md).<br>
 
-**I only own a pair of 8320A speakers, so I could only reverse engineer part of the protocol. I'm aware of differences in higher end speakers (e.g. 83x1 with 96 kHz DSP).** For areas where a command or parameter is not clear, I added a confidence factor. The code in the enclosed repository can be compiled as a control hub (default), protocol decoder or a protocol hex dump, allowing easy capture of unknown packets and future decoding.
+**I recently also discovered an independent parallel effort, complementary to this one. The author of that project and I started collaborating. I highly recommend looking at [espgensam](https://github.com/markbergsma/espgensam), especially if you are interested in a ESPHome solution with Home Assistant integration.**
+
+I only own a pair of 8320A speakers, so I could only reverse engineer part of the protocol. I'm aware of differences in higher end speakers (e.g. 83x1 with 96 kHz DSP). For areas where a command or parameter is not clear, I added a confidence factor. The code in the enclosed repository can be compiled as a control hub (default), protocol decoder or a protocol hex dump, allowing easy capture of unknown packets and future decoding.
 
 ## Code structure
 The code in this repository is structured as a set of libraries and hub functionality. The libraries implement the complete specs as documented and allow full decoding and sending of messages. A separate library implements the functionality for the replacement hub. I wrote and tested versions for the STM32F103 Bluepill, STM32F407, ESP32-C6, ESP32-S3. The code also supports an I2C SH1106 OLED, and encoder volume+button. To build a hub or an analyzer, you will also need a MAX485 board and an RJ45 jack. The current version uses individual OLED and encoders or integrated OLED/encoder board like <br><br>
