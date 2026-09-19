@@ -13,7 +13,7 @@ Welcome to the HLM documentation. The goal of this project is to enable limited 
 * The main goal of this project is to enable volume control (including mute and standby) of speakers not continuously connected to a GLM. If you own Genelec speakers, you owe it to yourself to get a GLM Calibration kit to get the best from your system. If you have multiple speakers in separate rooms, the HLM will allow you to control your speakers independently.
 <br>
 
-The GLM RS485 protocol has been reverse engineered with the help of LLMs, and I created a [GLM protocol spec](https://github.com/robcazzaro/hlm/blob/main/Genelec%20GLM%20Protocol.12.md).<br>
+The GLM RS485 protocol has been reverse engineered with the help of LLMs, and I created a [GLM protocol spec](https://github.com/robcazzaro/hlm/blob/main/docs/Genelec%20GLM%20Protocol.12.md).<br>
 
 **I recently also discovered an independent parallel effort, complementary to this one. The author of that project and I started collaborating. I highly recommend looking at [espgensam](https://github.com/markbergsma/espgensam), especially if you are interested in a ESPHome solution with Home Assistant integration.**
 
