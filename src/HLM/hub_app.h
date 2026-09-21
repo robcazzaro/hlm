@@ -10,7 +10,7 @@
 // WITHOUT ANY WARRANTY; without even the implied warranty of 
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU 
 // General Public License for more details.
-//
+// 
 // You should have received a copy of the GNU General Public License 
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 // 
@@ -30,11 +30,22 @@
 
 // --- State Machine ---
 typedef enum {
-    STATE_STANDALONE_IDLE,
-    STATE_DISCOVERY,
-    STATE_ACTIVE_POLLING,
-    STATE_ISS_IDLE          // NEW: heartbeat only, speakers left to their own ISS
+    STATE_STANDALONE_IDLE,   // boot wake: send power-on burst, then discover
+    STATE_DISCOVERY,         // FE probes, config any newly-answered speaker
+    STATE_ACTIVE_POLLING,    // normal operation: volume + 04 keep-alive + polls
+    STATE_ISS_IDLE,          // silence timeout: heartbeat only, speakers sleep
+    STATE_USER_STANDBY       // user-initiated standby: heartbeat only, OLED off
 } HubState_t;
+
+// --- Device class (0x84 first byte) ---
+#define DEVICE_CLASS_UNKNOWN    0x00
+#define DEVICE_CLASS_SUBWOOFER  0x01
+#define DEVICE_CLASS_TWO_WAY    0x02
+// 0x03 is a transient "standby" marker; it must not overwrite a known class.
+
+// --- Meter floors (spec section 8.1) ---
+#define METER_FLOOR_OUTPUT      0x80
+#define METER_FLOOR_INPUT       0x89
 
 // --- Speaker Registry ---
 typedef struct {
@@ -44,11 +55,16 @@ typedef struct {
     uint8_t missed_polls;
     bool config_queried;
     
-    // Telemetry fields
-    uint8_t temperature;
-    uint8_t vu1; // Absolute dBFS (0 = Loudest)
-    uint8_t vu2;
-    uint8_t play_state;
+    // Telemetry fields (spec section 8.1)
+    uint8_t temperature;         // 0x41 frame header, main temp in C
+    uint8_t device_class;        // 0x84 first byte: 01 sub, 02 two-way (03 standby does not overwrite)
+    uint8_t system_status;       // 0x47: 01 = ON, 02 = standby (SOLE authority on power state)
+    uint8_t input_meter;         // 0x42 (pre-volume input level)
+    uint8_t vu_hf;               // 0x43 (HF output meter)
+    uint8_t vu_mid;              // 0x44 (midrange output meter; three-way only, 0x80 when absent)
+    uint8_t vu_lf;               // 0x45 (LF output meter)
+    uint8_t vu_sub;              // 0x46 (subwoofer driver meter; subs only)
+    uint8_t state_flags_dynamic; // 0x84 second byte (opaque dynamic metric)
 } Speaker_t;
 
 // --- Global Variables ---

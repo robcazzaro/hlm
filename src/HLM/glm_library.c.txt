@@ -10,7 +10,7 @@
 // WITHOUT ANY WARRANTY; without even the implied warranty of 
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU 
 // General Public License for more details.
-// 
+//
 // You should have received a copy of the GNU General Public License 
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 // 
@@ -85,46 +85,14 @@ void db_to_volume_payload(float db, uint8_t *out_payload) {
     double linear_gain = pow(10.0, db / 20.0);
     uint32_t raw_value = (uint32_t)llround(linear_gain * 8388608.0);
     
-    // Stage 5 fix: clamp to the 24-bit unsigned ceiling the speakers actually
-    // use (0x7FFFFF = 0 dB, clipped). Was 0xFFFFFF, which is out of spec.
-    if (raw_value > 0x7FFFFF) {
-        raw_value = 0x7FFFFF;
+    if (raw_value > 0xFFFFFF) {
+        raw_value = 0xFFFFFF;
     }
     
     out_payload[0] = 0x1F;
     out_payload[1] = (raw_value >> 16) & 0xFF;
     out_payload[2] = (raw_value >> 8)  & 0xFF;
     out_payload[3] = raw_value & 0xFF;
-}
-
-
-// ============================================================================
-// STAGE 9: Store / Apply duck prelude and epilogue.
-//
-// The OEM issues two frames before a store or apply sequence to silence the
-// bus while configuration is pushed:
-//     1FF 1F 00 00 08   (pre-duck)
-//     1FF 1F 00 00 02   (duck: -132.4 dB, held for the burn duration)
-// approximately 1 ms apart.
-//
-// Because the hub's TX queue paces frames at 20 ms, our spacing is looser
-// than the OEM's. The speakers only care that both values arrive before the
-// configuration sequence begins.
-//
-// The epilogue restores the user's volume in a small burst so the speakers
-// latch it reliably. The OEM sends x5 over ~40 ms; at our 20 ms pacing this
-// is ~100 ms, which is functionally equivalent.
-// ============================================================================
-void send_store_duck(void) {
-    send_frame(0x01FF, (uint8_t[]){0x1F, 0x00, 0x00, 0x08}, 4);
-    send_frame(0x01FF, (uint8_t[]){0x1F, 0x00, 0x00, 0x02}, 4);
-}
-
-void send_store_restore(const uint8_t *vol_payload) {
-    if (!vol_payload) return;
-    for (int i = 0; i < 5; i++) {
-        send_frame(0x01FF, vol_payload, 4);
-    }
 }
 
 
@@ -348,13 +316,8 @@ __weak void unknown_message(const uint16_t *frame, uint16_t frame_len) {
 // ============================================================================
 // Handles incoming unescaped PEQ parameters, extracts biquad coefficients,
 // reverse-calculates original UI values, and prints them.
-//
-// STAGE 8: fs is now a parameter, selected by the caller from the speaker's
-// device class (see the dispatch in parse_message() at the bottom of this
-// file). Two-way monitors use 48 kHz, subwoofers use 12 kHz. Feeding the
-// wrong rate shifts every filter centre frequency by the ratio of the rates.
 // ============================================================================
-void on_peq_response(uint8_t session_id, const uint8_t *peq_data, size_t len, uint32_t fs) {
+void on_peq(uint8_t session_id, const uint8_t *peq_data, size_t len) {
     if (!peq_data || len < 21) {
         printf("  -> [Handler] Error: Invalid PEQ payload length\r\n");
         return;
@@ -449,7 +412,7 @@ void on_peq_response(uint8_t session_id, const uint8_t *peq_data, size_t len, ui
                 if (cos_w0 < 0.0f) cos_w0 = -cos_w0; 
                 if (cos_w0 > 1.0f)  cos_w0 = 1.0f;
                 if (cos_w0 < -1.0f) cos_w0 = -1.0f;
-                frequency = (acosf(cos_w0) * (float)fs) / (2.0f * (float)M_PI);
+                frequency = (acosf(cos_w0) * SAMPLE_RATE) / (2.0f * (float)M_PI);
             }
         } else {
             // Low Shelf Frequency Extraction
@@ -461,7 +424,7 @@ void on_peq_response(uint8_t session_id, const uint8_t *peq_data, size_t len, ui
                 if (cos_w0 < 0.0f) cos_w0 = -cos_w0; 
                 if (cos_w0 > 1.0f)  cos_w0 = 1.0f;
                 if (cos_w0 < -1.0f) cos_w0 = -1.0f;
-                frequency = (acosf(cos_w0) * (float)fs) / (2.0f * (float)M_PI);
+                frequency = (acosf(cos_w0) * SAMPLE_RATE) / (2.0f * (float)M_PI);
             }
         }
         q = 1.0f; 
@@ -481,7 +444,7 @@ void on_peq_response(uint8_t session_id, const uint8_t *peq_data, size_t len, ui
                 if (cos_w0 < -1.0f) cos_w0 = -1.0f;
                 
                 float w0 = acosf(cos_w0);
-                frequency = (w0 * (float)fs) / (2.0f * (float)M_PI);
+                frequency = (w0 * SAMPLE_RATE) / (2.0f * (float)M_PI);
                 
                 float denom_q = 2.0f * A * (1.0f - a2_norm);
                 if (fabsf(denom_q) > 1e-6f) {
@@ -645,30 +608,21 @@ int build_frame_16bit(uint16_t address_9bit, const uint8_t *payload, size_t payl
 
 
 // =====================================================================================
-// Converts a standard PEQ filter definition and sends it to the Genelec speakers.
-//
-// STAGE 8: fs is now a parameter. Design at the target device's rate:
-//   Two-way monitors (8320A, 8330A, ...): 48000 Hz
-//   Subwoofers       (7350A, ...):        12000 Hz
-//   Higher-end (83x1 series):             unresolved -- use 48000 Hz default
-// The same physical filter (e.g. a 40 Hz notch) produces very different
-// coefficients at 12 kHz vs 48 kHz, so passing the wrong rate shifts every
-// filter centre frequency by the ratio of the rates.
+// Converts standard PEQ filter definition and sending it to the Genelec speakers
 // =====================================================================================
 // @param index        The filter index (0x00 to 0x13).
 // @param type         The type of filter (Low Shelf, High Shelf, or Peaking).
 // @param frequency    Center/cutoff frequency in Hz.
 // @param gain_db      Gain in decibels.
 // @param q            Quality factor (used for Peaking/Notch filters).
-// @param fs           Design sample rate in Hz (device-class specific).
 // @param out_payload  Pointer to a buffer of at least 24 bytes.
 // @return             0 on success, -1 on invalid parameters.
 // ============================================================================
-int generate_peq_payload(uint8_t index, FilterType type, float frequency, float gain_db, float q, uint32_t fs, uint8_t *out_payload) {
+int generate_peq_payload(uint8_t index, FilterType type, float frequency, float gain_db, float q, uint8_t *out_payload) {
     if (!out_payload || index > 0x13) {
         return -1;
     }
-    if (frequency <= 0.0f || frequency >= ((float)fs / 2.0f)) {
+    if (frequency <= 0.0f || frequency >= (SAMPLE_RATE / 2.0f)) {
         return -1;
     }
 
@@ -691,7 +645,7 @@ int generate_peq_payload(uint8_t index, FilterType type, float frequency, float 
     }
 
     // High-precision double intermediate math variables to minimize rounding drift
-    double w0 = 2.0 * M_PI * (double)frequency / (double)fs;
+    double w0 = 2.0 * M_PI * (double)frequency / (double)SAMPLE_RATE;
     double cos_w0 = cos(w0);
     double sin_w0 = sin(w0);
     
@@ -773,15 +727,15 @@ void print_message_for_troubleshooting(const uint16_t *frame, uint16_t bytes_rea
     }
 
     uint8_t unescaped[MAX_FRAME_SIZE];
-    size_t unescaped_len = unescape_frame(frame, bytes_read, unescaped);  // ← includes address
+    size_t unescaped_len = unescape_frame_to_payload(frame, bytes_read, unescaped);
 
-    if (unescaped_len < 3) {
+    if (unescaped_len < 2) {
         printf("%03X (too short)\r\n", frame[0]);
         return;
     }
 
-    size_t payload_len = unescaped_len - 3;                                             // addr(1) + crc(2)
-    uint16_t calculated_crc = crc16_gsm(unescaped, unescaped_len - 2);     // ← include address
+    size_t payload_len = unescaped_len - 2;
+    uint16_t calculated_crc = crc16_gsm(unescaped, payload_len);
 
     // print raw length
     printf(" %d ", bytes_read);
@@ -799,70 +753,52 @@ void print_message_for_troubleshooting(const uint16_t *frame, uint16_t bytes_rea
 }
 
 
-// ============================================================================
-// Flash Commit sequence (spec section 9, "Flash Commit / Standalone Saving")
-//
-// STAGE 9 changes:
-//   - iss_sleep_delay is now 4-byte BE (was 2-byte)
-//   - 0x40 payload uses explicit input_idx / source / pair_selector /
-//     aes3_channel (was [00][input+1][02][config_counter])
-//   - level scaling uses 2^23 = 8388608.0f (was 2^23 - 1) and clamps to
-//     0x7FFFFF (0 dB ceiling)
-//
-// Caller is expected to invoke send_store_duck() before calling this per
-// speaker, and send_store_restore() after the loop. This function itself
-// does NOT send the duck, so it can be looped over multiple speakers without
-// re-ducking on each one.
-// ============================================================================
 int send_flash_commit(uint8_t sess_id, const FlashCommitSettings_t *settings) {
     if (!settings) return -1;
     if (settings->max_level_db > 0.0f || settings->max_level_db < -20.0f) return -2;
     if (settings->startup_level_db > 0.0f || settings->startup_level_db < -60.0f) return -3;
     if (settings->iss_sensitivity > 2) return -4;
     if (settings->input_select > 2) return -5;
-    if (settings->aes3_channel > 3) return -6;
 
     uint16_t unicast_addr = 0x0100 | sess_id;
-    uint8_t payload[12];
+    uint8_t payload[8];
 
-    // 1. Max Level Restriction (0x10 01 00 [3-byte BE])
+    // 1. Max Level Restriction (0x10 01 00 [3-byte])
+    // Math TBD, using approximation: raw = 10^(db/20) * 0x7FFFFF
     payload[0] = 0x10; payload[1] = 0x01; payload[2] = 0x00;
     float max_lin = powf(10.0f, settings->max_level_db / 20.0f);
-    uint32_t max_raw = (uint32_t)llroundf(max_lin * 8388608.0f);
-    if (max_raw > 0x7FFFFF) max_raw = 0x7FFFFF;
+    uint32_t max_raw = (uint32_t)llroundf(max_lin * 8388607.0f);
     payload[3] = (max_raw >> 16) & 0xFF;
-    payload[4] = (max_raw >> 8)  & 0xFF;
-    payload[5] = (max_raw)       & 0xFF;
+    payload[4] = (max_raw >> 8) & 0xFF;
+    payload[5] = max_raw & 0xFF;
     send_frame(unicast_addr, payload, 6);
 
-    // 2. Startup Level (0x10 01 05 [3-byte BE])
+    // 2. Startup Level (0x10 01 05 [3-byte])
     payload[2] = 0x05;
     float start_lin = powf(10.0f, settings->startup_level_db / 20.0f);
-    uint32_t start_raw = (uint32_t)llroundf(start_lin * 8388608.0f);
-    if (start_raw > 0x7FFFFF) start_raw = 0x7FFFFF;
+    uint32_t start_raw = (uint32_t)llroundf(start_lin * 8388607.0f);
     payload[3] = (start_raw >> 16) & 0xFF;
-    payload[4] = (start_raw >> 8)  & 0xFF;
-    payload[5] = (start_raw)       & 0xFF;
+    payload[4] = (start_raw >> 8) & 0xFF;
+    payload[5] = start_raw & 0xFF;
     send_frame(unicast_addr, payload, 6);
 
-    // 3. ISS Sleep Delay (0x3A 01 [4-byte BE], STAGE 9)
-    //    Value in minutes. 0xFFFFFFFF = Never.
+    // 3. ISS Sleep Delay (0x3A 01 [4-byte BE])
     payload[0] = 0x3A; payload[1] = 0x01;
     payload[2] = (settings->iss_sleep_delay >> 24) & 0xFF;
     payload[3] = (settings->iss_sleep_delay >> 16) & 0xFF;
-    payload[4] = (settings->iss_sleep_delay >> 8)  & 0xFF;
-    payload[5] = (settings->iss_sleep_delay)       & 0xFF;
+    payload[4] = (settings->iss_sleep_delay >> 8) & 0xFF;
+    payload[5] = settings->iss_sleep_delay & 0xFF;
     send_frame(unicast_addr, payload, 6);
 
     // 4. ISS Sensitivity (0x3A 02 [4-byte])
     payload[1] = 0x02;
-    uint32_t sens_val = 0xFFFFFFB5;                            // High
+    uint32_t sens_val = 0xFFFFFFB5; // High
     if (settings->iss_sensitivity == 1) sens_val = 0xFFFFFFBC; // Medium
     if (settings->iss_sensitivity == 2) sens_val = 0xFFFFFFC3; // Low
     payload[2] = (sens_val >> 24) & 0xFF;
     payload[3] = (sens_val >> 16) & 0xFF;
-    payload[4] = (sens_val >> 8)  & 0xFF;
-    payload[5] = (sens_val)       & 0xFF;
+    payload[4] = (sens_val >> 8) & 0xFF;
+    payload[5] = sens_val & 0xFF;
     send_frame(unicast_addr, payload, 6);
 
     // 5. LED State (0x3A 06 [1-byte])
@@ -870,14 +806,11 @@ int send_flash_commit(uint8_t sess_id, const FlashCommitSettings_t *settings) {
     payload[2] = settings->led_on ? 0x00 : 0x01;
     send_frame(unicast_addr, payload, 3);
 
-    // 6. Standalone Config Block (0x40 [input_idx] [source] [pair] [aes3])
-    //    STAGE 9: aes3_channel is the 4th payload byte. Previously the code
-    //    wrote config_counter here, which is not what the spec calls for.
-    payload[0] = 0x40;
-    payload[1] = settings->input_idx;
-    payload[2] = settings->input_select + 1;  // 1=Analog, 2=Digital, 3=Automatic
-    payload[3] = settings->pair_selector;
-    payload[4] = settings->aes3_channel;
+    // 6. Standalone Config Block (0x40 00 [Input] 02 [Counter])
+    payload[0] = 0x40; payload[1] = 0x00;
+    payload[2] = settings->input_select + 1; // 1=Ana, 2=Dig, 3=Auto
+    payload[3] = 0x02;
+    payload[4] = settings->config_counter;
     send_frame(unicast_addr, payload, 5);
 
     // 7. Commit to Flash (0x15 33 00)
@@ -900,8 +833,8 @@ int send_flash_commit(uint8_t sess_id, const FlashCommitSettings_t *settings) {
 // Notes:
 //   - CRC is CRC-16/GSM (Poly 0x1021, Init 0x0000, XorOut 0xFFFF).
 //   - CRC is calculated over Address + Payload, appended in Big-Endian order.
-//   - Speaker payloads always start with 0x09. A 0x06 or 0x07 wrapper/sequence
-//     byte may follow the 0x09 header before the actual response data.
+//   - Speaker payloads always start with 0x09. A 0x06 wrapper/sequence byte
+//     may follow the 0x09 header before the actual response data.
 //   - All multi-byte values are Big-Endian unless otherwise specified.
 //
 // ============================================================================
@@ -910,42 +843,38 @@ int send_flash_commit(uint8_t sess_id, const FlashCommitSettings_t *settings) {
 // CMD  | TARGET  | PAYLOAD FORMAT                  | DESCRIPTION
 // -----|---------|---------------------------------|---------------------------
 // 0x02 | 0x01F0  | 02 [ID1] [ID2] [ID3] [SessID]  | Assign Session ID
-// 0x04 | 0x01FF  | 04                              | Keep-Alive / Online Refresh
 // 0x04 | 0x01FF  | 04 BC 84                        | Broadcast Config / Sync
 // 0x05 | Unicast | 05 04 00 00 00 FF FF EA ...     | Unicast DSP Config
 // 0x08 | Unicast | 08                              | Telemetry Poll
 // 0x10 | Unicast | 10 [Sub] [Data...]              | DSP Parameter Update
 //      |         |   Sub 0E: [Idx] [5x Float32 LE] |   Set PEQ Filter
 //      |         |   Sub 02: 00 00 00 00           |   DSP Config 02
-//      |         |   Sub 01: [Sub] [3-byte BE]     |   Level Compensation
-// 0x15 | Unicast | 15 33 00                        | Commit to Flash
-// 0x17 | Unicast | 17 01                           | Prepare for Configuration
+//      |         |   Sub 01: 00 7F FF FF ...       |   DSP Config 01
+// 0x17 | Unicast | 17 01 [Data...]                 | Unicast Config
 // 0x19 | Unicast | 19 01                           | Serial Number Request
 // 0x1F | 0x01FF/ | 1F [B2] [B1] [B0]              | Set Volume
 //      | 0x01F0  | (24-bit BE fixed-point gain)    | (1.0 gain = 0x800000)
-// 0x2B | Unicast | 2B [03 / 04 / 08]               | Mute / LED
+// 0x2B | Unicast | 2B [03 / 04]                    | Set Mute (03=ON, 04=OFF)
 // 0x39 | Unicast | 39                              | System Info Request
-// 0x3A | 0x01FF/ | 3A 03 [02 / 00 / 7F / 01]       | System Power (spec v12 semantics)
-//      | 0x01F0  | 3A 01 [4-byte BE]               | ISS Sleep Delay
-//      |         | 3A 02 [4-byte BE]               | ISS Sensitivity
-//      |         | 3A 06 [1-byte]                  | LED State
-// 0x3B | Unicast | 3B [Value16]                    | Bass Management / Crossover
-// 0x3D | Unicast | 3D 00 00                        | Input Select Sync
-// 0x40 | Unicast | 40 [input_idx] [source] [pair] [aes3] | Standalone Config Block
+// 0x3A | 0x01FF/ | 3A 03 [02 / 00]                 | System Power (02=ON,00=OFF)
+//      | 0x01F0  |                                 |
+// 0x3B | Unicast | 3B 00 01                        | Unicast Config (Bass Mgmt)
+// 0x3D | Unicast | 3D 00 00                        | Unicast Config (Input Sel)
+// 0x40 | Unicast | 40 00 01 02 00                  | Unicast Config
 // 0xFE | 0x01FF  | FE                              | Discovery Probe
 //
 // ============================================================================
 // 2. SPEAKER RESPONSES (Speaker -> Hub, Address = 0x0101)
-// ----------------------------------------------------------------------------------------------
+// ----------------------------------------------------------------------------------------
 // RESP | PAYLOAD FORMAT                                                  | DESC
 // -----|-----------------------------------------------------------------|----------------
 // 0x09 | 09 [SessID]                                                     | Session ID ACK
 // 0x09 | 09 [ID1] [ID2] [ID3]                                            | Hardware ID Resp
 // 0x09 | 09 5D E7                                                        | Generic ACK
-// 0x41 | 09 [06/07] 41 [Temp] 81 00 [VU1] 83 00 [VU2] 42 [VU3] ...      | Telemetry Resp
-//      | 43 [VU4] 44 [VU5] 45 [VU6] 46 [VU7] 47 [State] 84 CC [Val]      |
-// 0x63 | 09 [NUL-terminated ASCII String]                                | System Info Resp
-// ASCII| 09 [15-char ASCII Serial]                                       | Serial Num Resp
+// 0x41 | 09 [06] 41 [Temp] 81 00 [VU1] 83 00 [VU2] 42 [VU3] 43 [VU4]     | Telemetry Resp
+//      | 45 [VU5] 47 [State] 84 02 [Vol]                                 |
+// 0x63 | 09 [06] 63 [ASCII String \0]                                    | System Info Resp
+// ASCII| 09 [06] [16-byte ASCII Serial]                                  | Serial Num Resp
 // ============================================================================
  
 void parse_message(uint16_t *rx_data, uint16_t bytes_read) {
@@ -990,8 +919,6 @@ void parse_message(uint16_t *rx_data, uint16_t bytes_read) {
                 break;
             case 0x3A: 
                 if (payload_len >= 3) {
-                    // Per spec v12: 3A 03 02 = standby prepare, 3A 03 00 = power off,
-                    // 3A 03 7F / 3A 03 01 = wake trigger. No longer a simple on/off.
                     on_system_power(payload[2] == 0x02);
                 } else {
                     unknown_message(rx_data, frame_len);
@@ -1021,24 +948,7 @@ void parse_message(uint16_t *rx_data, uint16_t bytes_read) {
             case 0x08: on_telemetry_poll(sess_id); break;
             case 0x10: 
                 if (payload_len >= 2) {
-                    if (payload[1] == 0x0E) {
-                        // STAGE 8: look up the speaker's device class to select
-                        // the PEQ design rate. Two-way = 48 kHz, sub = 12 kHz.
-                        // In the analyzer build (no HLM_HUB), default to 48 kHz.
-                        uint32_t fs = SAMPLE_RATE_2WAY;
-#ifdef HLM_HUB
-                        for (int i = 0; i < MAX_SPEAKERS; i++) {
-                            if (speaker_registry[i].active &&
-                                speaker_registry[i].sess_id == sess_id) {
-                                if (speaker_registry[i].device_class == DEVICE_CLASS_SUBWOOFER) {
-                                    fs = SAMPLE_RATE_SUB;
-                                }
-                                break;
-                            }
-                        }
-#endif
-                        on_peq_response(sess_id, &payload[2], payload_len - 2, fs);
-                    }
+                    if (payload[1] == 0x0E) on_peq(sess_id, &payload[2], payload_len - 2); 
                     else if (payload[1] == 0x02) on_dsp_cmd_02(sess_id, &payload[2], payload_len - 2);
                     else if (payload[1] == 0x01) on_dsp_cmd_01(sess_id, &payload[2], payload_len - 2);
                     else unknown_message(rx_data, frame_len);
@@ -1072,9 +982,8 @@ void parse_message(uint16_t *rx_data, uint16_t bytes_read) {
     else if (addr == 0x0101) {
         // --- SPEAKER RESPONSE ---
         if (payload[0] == 0x09) {
-            // STAGE 1: bare 09 06 or 09 07 = "settings write in progress, no
-            // telemetry this round". Both markers are observed in captures.
-            if (payload_len == 2 && (payload[1] == 0x06 || payload[1] == 0x07)) {
+            // --- NEW: handle Flash Write Complete (09 06) ---
+            if (payload_len >= 2 && payload[1] == 0x06 && payload_len == 2) {
                 on_flash_write_complete();
                 return;
             }
@@ -1083,9 +992,8 @@ void parse_message(uint16_t *rx_data, uint16_t bytes_read) {
                 on_generic_ack();
             } 
             else if (payload_len >= 2) {
-                // STAGE 1: optional busy marker (0x06 or 0x07) may appear before
-                // the real payload byte.
-                int offset = (payload[1] == 0x06 || payload[1] == 0x07) ? 1 : 0;
+                // Handle the 0x06 wrapper byte if present
+                int offset = (payload[1] == 0x06) ? 1 : 0;
                 
                 if (payload_len <= 1 + offset) {
                     unknown_message(rx_data, frame_len);

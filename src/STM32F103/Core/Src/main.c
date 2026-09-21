@@ -1,7 +1,7 @@
 /* USER CODE BEGIN Header */
 
 /* 
- * This file is part of the Homebrew Loudspeaker Manager distribution (https://github.com/robcazzaro/HLM).
+ * This file is part of the Homebrew Loudspeaker Manager distribution (https://github.com/robcazzaro/hlm).
  * Copyright (c) 2026 Rob Cazzaro.
  * 
  * This program is free software: you can redistribute it and/or modify  

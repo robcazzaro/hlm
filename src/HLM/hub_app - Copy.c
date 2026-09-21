@@ -10,7 +10,7 @@
  * WITHOUT ANY WARRANTY; without even the implied warranty of 
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU 
  * General Public License for more details.
- * 
+ *
  * You should have received a copy of the GNU General Public License 
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
@@ -38,40 +38,7 @@
 // ============================================================================
 #define ISS_IDLE_TIMEOUT_MS    30000UL // Silence before the hub enters ISS idle
 #define HEARTBEAT_INTERVAL_MS  610     // OEM standalone heartbeat cadence (ms)
-#define VU_MUSIC_THRESHOLD     163     // Merged VU above this = music (ISS idle timer)
-
-// ----------------------------------------------------------------------------
-// VU bar mapping (spec section 8.1)
-//
-// Single linear map, calibrated against reference logs on 8320A monitors.
-// Merged raw = max(0x43 HF, 0x44 mid, 0x45 LF), all of which floor at 0x80
-// (128) and slope ~1 dB per count.
-//
-// Reference points observed in logs:
-//   silence            : 128
-//   barely audible     : 173-178  (-80 dB playback)  -> target ~5
-//   normal music       : 205-210  (-50 dB playback)  -> target ~29 (middle)
-//   loud passages      : 220-225  (-20 dB playback)  -> target ~40
-//   peaks / clipping   : 240+
-//
-// Fitted from (175, 5) and (207, 29):
-//   slope  = 3/4  (0.75)
-//   offset = 168  (raw value below which the bar reads 0)
-//
-// bar = (raw - VU_OFFSET_RAW) * VU_SLOPE_NUM / VU_SLOPE_DEN
-//
-// Tuning:
-//   Increase VU_OFFSET_RAW  -> whole display sits lower (dead zone larger)
-//   Increase VU_SLOPE_NUM   -> bar more sensitive (moves more per dB)
-//   Increase VU_SLOPE_DEN   -> bar less sensitive
-// ----------------------------------------------------------------------------
-#define VU_OFFSET_RAW   168
-#define VU_SLOPE_NUM    3
-#define VU_SLOPE_DEN    4
-
-// Stage 7: retry burst issued to a dead session address before eviction.
-#define EVICT_RETRY_COUNT      4
-#define EVICT_RETRY_SPACING_MS 9
+#define VU_MUSIC_THRESHOLD     163     // VU above this = music (matches OLED zero-bar cutoff)
 
 // ============================================================================
 // Global State & Variables
@@ -81,6 +48,7 @@ uint8_t next_available_sess_id = 0x02; // Start at 0x02 (0x01 is Hub)
 HubState_t hub_state = STATE_STANDALONE_IDLE;
 bool is_muted = false; // Global mute state tracker
 bool new_speaker_discovered = false; // Flag to trigger immediate state transition
+bool standby_active = false;
 
 // TX Queue
 typedef struct {
@@ -111,13 +79,6 @@ int16_t last_sent_volume = -999;
 uint8_t last_polled_sess_id = 0;
 uint8_t telemetry_poll_index = 0;
 
-// ----------------------------------------------------------------------------
-// Small helper: is the hub in any sleeping state?
-// ----------------------------------------------------------------------------
-static inline bool hub_is_sleeping(void) {
-    return hub_state == STATE_USER_STANDBY || hub_state == STATE_ISS_IDLE;
-}
-
 // ============================================================================
 // RS 485 TX Queue Management
 // ============================================================================
@@ -141,7 +102,6 @@ bool tx_queue_pop(uint16_t *out_frame, uint16_t *out_len) {
 }
 
 
-// Standard path: build + enqueue (20 ms paced by process_tx_queue).
 void send_frame(uint16_t addr_9bit, const uint8_t *payload, size_t payload_len) {
     uint16_t frame[MAX_FRAME_SIZE];
     int len = build_frame_16bit(addr_9bit, payload, payload_len, frame, MAX_FRAME_SIZE);
@@ -153,48 +113,6 @@ void send_frame(uint16_t addr_9bit, const uint8_t *payload, size_t payload_len) 
 }
 
 
-// ----------------------------------------------------------------------------
-// Immediate path: build + transmit now, bypassing the 20 ms queue.
-// Used only for the Stage 7 retry burst, which must go out at ~9 ms spacing.
-// Not for general use: this blocks on the RS-485 transmitter.
-// ----------------------------------------------------------------------------
-void send_frame_immediate(uint16_t addr_9bit, const uint8_t *payload, size_t payload_len) {
-    uint16_t frame[MAX_FRAME_SIZE];
-    int len = build_frame_16bit(addr_9bit, payload, payload_len, frame, MAX_FRAME_SIZE);
-    if (len > 0) {
-        send_data(frame, (uint16_t)len);
-    }
-}
-
-
-// ============================================================================
-// VU merge helper
-//
-// Merges HF / mid / LF output meters with max(). Rationale:
-//   - Spec section 8.1: all output meters floor at 0x80 and slope ~1 dB/count.
-//   - Two-way speakers emit 0x43 and 0x45 only. 0x44 stays at its init value
-//     (0x80) and max() ignores it naturally -- no special-casing required.
-//   - Three-way speakers emit 0x44 as well; max() picks up mid content that
-//     neither 0x43 nor 0x45 will reflect.
-//   - Subwoofers (device class 0x01) do not contribute to the VU bar.
-// ============================================================================
-static inline uint8_t merge_output_meters(const Speaker_t *s) {
-    uint8_t raw = s->vu_hf;
-    if (s->vu_mid > raw) raw = s->vu_mid;
-    if (s->vu_lf  > raw) raw = s->vu_lf;
-    return raw;
-}
-
-// Single linear map. See the VU_OFFSET_RAW / VU_SLOPE_* comments above for
-// the fitting details and tuning guidance.
-static inline int8_t raw_to_bar(uint8_t raw) {
-    if (raw <= VU_OFFSET_RAW) return 0;
-    int32_t bar = ((int32_t)raw - VU_OFFSET_RAW) * VU_SLOPE_NUM / VU_SLOPE_DEN;
-    if (bar > 64) bar = 64;
-    return (int8_t)bar;
-}
-
-
 // ============================================================================
 // Display Update Helper (throttled to 20Hz max to prevent I2C lockups)
 // ============================================================================
@@ -203,24 +121,36 @@ void update_oled_display(void) {
     if (now - last_oled_attempt < 50) return;
     last_oled_attempt = now;
 
-    // Never draw while the display is powered down (either sleeping state)
-    if (hub_is_sleeping()) return;
+    // Never draw while the display is powered down (standby / ISS idle)
+    if (standby_active || hub_state == STATE_ISS_IDLE) return;
 
     int8_t bar1 = 0, bar2 = 0;
     uint8_t active_count = 0;
 
     for (int i = 0; i < MAX_SPEAKERS; i++) {
         if (speaker_registry[i].active) {
-            // Subwoofers do not contribute to the VU bar.
-            if (speaker_registry[i].device_class == DEVICE_CLASS_SUBWOOFER) continue;
+            uint8_t raw = speaker_registry[i].vu1;
+            int16_t mapped = 0;
 
-            int8_t bar = raw_to_bar(merge_output_meters(&speaker_registry[i]));
+            // Remapped boundaries to shift the curve down
+            if (raw <= 163) {
+                mapped = 0;
+            } else if (raw <= 191) {
+                // Map 164-191 to 0-13
+                mapped = ((raw - 163) * 13) / 28;
+            } else {
+                // Map 192+ to 14-63 (hits exactly 63 at raw=241)
+                mapped = 14 + (raw - 192);
+            }
 
+            // Clamp to OLED limits (just in case raw is > 241)
+            if (mapped > 63) mapped = 63;
+            
             if (active_count == 0) {
-                bar1 = bar;
+                bar1 = (int8_t)mapped;
             } else if (active_count == 1) {
-                bar2 = bar;
-                break; // Only need the first two non-sub active speakers
+                bar2 = (int8_t)mapped;
+                break; // Only need the first two active speakers
             }
             active_count++;
         }
@@ -233,74 +163,62 @@ void update_oled_display(void) {
 }
 
 
-// ============================================================================
-// Stage 3: User standby
-//
-// OEM hub sequence captured on the bus:
-//     (3A 03 02) x2, (3A 03 00) x2 on 0x01FF
-// Double 03 02 / double 03 00 disables ISS auto-restart.
-// The hub then stays in STATE_USER_STANDBY, emitting ONLY the standalone
-// heartbeat (1F0 1F ...) until the user acts.
-// ============================================================================
 void enter_standby(void) {
-    // Power-off sequence: prepare x2, off x2. Do not preempt with FE / volume.
+    // Duplicates OEM hub sequence
     send_frame(0x01FF, (uint8_t[]){0x3A, 0x03, 0x02}, 3);
     send_frame(0x01FF, (uint8_t[]){0x3A, 0x03, 0x02}, 3);
     send_frame(0x01FF, (uint8_t[]){0x3A, 0x03, 0x00}, 3);
     send_frame(0x01FF, (uint8_t[]){0x3A, 0x03, 0x00}, 3);
 
-    // Synchronise the stored volume so a later knob turn doesn't trigger a
-    // spurious wake on a stale comparison.
+    // Synchronise the stored volume to prevent an immediate wake-up
     last_sent_volume = global_volume;
 
-    oled_off();
-    hub_state = STATE_USER_STANDBY;
+    oled_off();      // OLED is off, but the HLM keeps sending keep alive packets like the OEM hub
+    standby_active = true;
+    hub_state = STATE_ACTIVE_POLLING;
     last_state_tick = bsp_millis();
 }
 
 
-// ============================================================================
-// Stage 3: Wake
-//
-// From STATE_USER_STANDBY:
-//   (3A 03 7F, 3A 03 01) x3, no trailing 03 02. Spec v12.
-// From STATE_ISS_IDLE:
-//   No power commands. Speakers were never off; audio / re-enumeration wakes
-//   them.
-// ============================================================================
 void wake_up_system(void) {
-    HubState_t prev_state = hub_state;   // capture before we transition
-
     oled_write_command(0xAF);   // turn on OLED
 
-    // Clean wake state: never resume muted, and open a fresh ISS idle window.
+    // Clean wake state: never resume muted (matches build_config_sequence's
+    // 2B 04, which unmutes the speakers on every re-enumeration anyway),
+    // and open a fresh ISS idle window.
     is_muted = false;
     last_music_ms = bsp_millis();
 
-    // Always clear the speaker registry - ensures a clean re-enumeration.
+    // Always clear the speaker registry - ensures a clean re-enumeration
     memset((void*)speaker_registry, 0, sizeof(speaker_registry));
     next_available_sess_id = 0x02;
     telemetry_poll_index = 0;
     new_speaker_discovered = false;
 
-    if (prev_state == STATE_USER_STANDBY) {
-        // Wake trigger: v12 says (7F, 01) x3 with no trailing 03 02.
-        for (int i = 0; i < 3; i++) {
-            send_frame(0x01FF, (uint8_t[]){0x3A, 0x03, 0x7F}, 3);
-            send_frame(0x01FF, (uint8_t[]){0x3A, 0x03, 0x01}, 3);
-        }
+    if (standby_active) {
+        // Wake from USER STANDBY: the speakers are powered down and need the
+        // OEM power-on sequence. Proven by weeks of use - do not touch.
+        send_frame(0x01FF, (uint8_t[]){0x3A, 0x03, 0x7F}, 3);  // keep-alive 1
+        send_frame(0x01FF, (uint8_t[]){0x3A, 0x03, 0x01}, 3);  // keep-alive 2
+        send_frame(0x01FF, (uint8_t[]){0x3A, 0x03, 0x02}, 3);  // System ON
     }
-    // From STATE_ISS_IDLE: nothing to send. Re-enumeration alone is the wake.
+    // Wake from ISS IDLE: send NO 3A 03 power commands at all. The speakers
+    // are either ON and playing (a power command burst to playing speakers
+    // puts them in standby ~1.2 s later - see the 183 s wake capture, where
+    // 3A 03 02 was followed by 47 02 in telemetry) or ISS-sleeping (the OEM
+    // heartbeat capture shows the correct action is nothing: audio wakes
+    // them via ISS auto-restart). Re-enumeration alone is the "wake".
 
     // Restore current volume (fixed 3-byte OEM encoding)
     uint8_t vol_payload[4];
     format_volume_payload(global_volume, vol_payload);
     send_frame(0x01FF, vol_payload, 4);
-    last_sent_volume = global_volume;
+    last_sent_volume = global_volume;   // wake already asserted it (no duplicate send)
 
     // Immediate discovery
     send_frame(0x01FF, (uint8_t[]){0xFE}, 1);
 
+    standby_active = false;
     hub_state = STATE_DISCOVERY;
     last_state_tick = bsp_millis();
 }
@@ -332,7 +250,7 @@ void format_volume_payload(int16_t vol_db_tenths, uint8_t *out_payload) {
 void check_volume_change(void) {
 
     if (global_volume != last_sent_volume) {
-        if (hub_is_sleeping()) {
+        if (standby_active || hub_state == STATE_ISS_IDLE) {
             // Any user action restarts the hub from a clean state.
             // wake_up_system() already asserts the NEW volume (and updates
             // last_sent_volume) and starts discovery, so we are done here.
@@ -362,7 +280,7 @@ void check_volume_change(void) {
 // enter standby by themselves. This is exactly the bus state we must hold to
 // let the speakers sleep. The hub exits ISS idle only on user action
 // (volume change / click / long press), then re-enumerates from scratch:
-// only global_volume survives; mute is cleared.
+// only global_volume survives; mute and standby are cleared.
 
 // OEM-exact standalone heartbeat: 3-byte Set Volume payload on 0x01F0 with
 // the current global_volume. At the default -50 dB this reproduces the
@@ -389,12 +307,12 @@ void enter_iss_idle(void) {
 // ============================================================================
 void button_click_callback(void) {
     // Any user action restarts the hub from a clean state
-    if (hub_is_sleeping()) {
+    if (standby_active || hub_state == STATE_ISS_IDLE) {
         wake_up_system();
         return;
     }
 
-    // Toggle mute (Stage 4: two interleaved rounds, spec section 7)
+    // Toggle mute (unchanged)
     is_muted = !is_muted;
 
     // Refresh the ISS idle window: idle entry is suppressed while muted, so
@@ -403,11 +321,9 @@ void button_click_callback(void) {
     last_music_ms = bsp_millis();
 
     uint8_t payload[2] = {0x2B, is_muted ? 0x03 : 0x04};
-    for (int round = 0; round < 2; round++) {
-        for (int i = 0; i < MAX_SPEAKERS; i++) {
-            if (speaker_registry[i].active) {
-                send_frame(0x0100 | speaker_registry[i].sess_id, payload, 2);
-            }
+    for (int i = 0; i < MAX_SPEAKERS; i++) {
+        if (speaker_registry[i].active) {
+            send_frame(0x0100 | speaker_registry[i].sess_id, payload, 2);
         }
     }
     update_oled_display();
@@ -415,9 +331,11 @@ void button_click_callback(void) {
 
 
 void button_longpress_callback(void) {
-    // A long press while sleeping restarts the hub.
-    if (hub_is_sleeping()) {
-        wake_up_system();
+    // A long press while sleeping (standby or ISS idle) restarts the hub.
+    // The user may long-press thinking the system is muted: restarting is
+    // the safe interpretation either way.
+    if (standby_active || hub_state == STATE_ISS_IDLE) {
+        wake_up_system();   // exit standby / restart from ISS idle
         return;
     }
     enter_standby();        // go to standby
@@ -426,40 +344,6 @@ void button_longpress_callback(void) {
 
 void button_doubleclick_callback(void) {
     // No action for now
-}
-
-
-// ============================================================================
-// Session ID Allocator
-// ----------------------------------------------------------------------------
-// Returns the next unused Session ID in [0x02, 0xFE], scanning forward from
-// next_available_sess_id and skipping any ID currently held by an active
-// speaker. This is what prevents a collision when a flapping speaker keeps
-// re-registering and the counter eventually wraps: the counter alone is not
-// a source of truth, the registry is.
-//
-// Returns 0x00 if every ID is taken (impossible with sane MAX_SPEAKERS,
-// but kept as a safety valve).
-// ============================================================================
-static uint8_t allocate_next_sess_id(void) {
-    for (uint16_t attempts = 0; attempts < 0xFD; attempts++) {   // 0x02..0xFE = 253 IDs
-        uint8_t candidate = next_available_sess_id;
-
-        // Advance the cursor for the next call, wrapping in range
-        next_available_sess_id++;
-        if (next_available_sess_id > 0xFE) next_available_sess_id = 0x02;
-
-        // Reject any candidate already held by an active speaker
-        bool in_use = false;
-        for (int j = 0; j < MAX_SPEAKERS; j++) {
-            if (speaker_registry[j].active && speaker_registry[j].sess_id == candidate) {
-                in_use = true;
-                break;
-            }
-        }
-        if (!in_use) return candidate;
-    }
-    return 0x00;   // no free ID
 }
 
 
@@ -478,28 +362,17 @@ void on_speaker_hw_id(const uint8_t hw_id[3], const uint8_t *payload, size_t len
     
     for (int i = 0; i < MAX_SPEAKERS; i++) {
         if (!speaker_registry[i].active) {
-            uint8_t new_sess = allocate_next_sess_id();
-            if (new_sess == 0x00) return;   // registry full, drop the probe
-
             memcpy(speaker_registry[i].hw_id, hw_id, 3);
-            speaker_registry[i].sess_id = new_sess;
+            speaker_registry[i].sess_id = next_available_sess_id++;
             speaker_registry[i].active = true;
             speaker_registry[i].config_queried = false;
             speaker_registry[i].missed_polls = 0;
-
-            // Initialise telemetry fields to safe floor values. The real
-            // values arrive with the first telemetry frame.
-            speaker_registry[i].temperature = 0;
-            speaker_registry[i].device_class = DEVICE_CLASS_UNKNOWN;
-            speaker_registry[i].system_status = 0x01;   // assume ON until 0x47 says otherwise
-            speaker_registry[i].input_meter = METER_FLOOR_INPUT;
-            speaker_registry[i].vu_hf = METER_FLOOR_OUTPUT;
-            speaker_registry[i].vu_mid = METER_FLOOR_OUTPUT;
-            speaker_registry[i].vu_lf = METER_FLOOR_OUTPUT;
-            speaker_registry[i].vu_sub = METER_FLOOR_OUTPUT;
-            speaker_registry[i].state_flags_dynamic = 0;
+            speaker_registry[i].vu1 = 100;
+            speaker_registry[i].vu2 = 100;
             
-            uint8_t assign_payload[5] = {0x02, hw_id[0], hw_id[1], hw_id[2], new_sess};
+            if (next_available_sess_id > 0xFE) next_available_sess_id = 0x02;
+            
+            uint8_t assign_payload[5] = {0x02, hw_id[0], hw_id[1], hw_id[2], speaker_registry[i].sess_id};
             send_frame(0x01F0, assign_payload, 5);
             
             // Immediately trigger configuration without waiting for the next tick
@@ -510,29 +383,9 @@ void on_speaker_hw_id(const uint8_t hw_id[3], const uint8_t *payload, size_t len
 }
 
 
-// ----------------------------------------------------------------------------
-// Telemetry TLV walk (spec v12, section 8.1)
-//
-// Tag/value layouts, per spec:
-//   0x42  1 byte   input meter (pre-volume)
-//   0x43  1 byte   HF output meter
-//   0x44  1 byte   midrange output meter (three-way only)
-//   0x45  1 byte   LF output meter
-//   0x46  1 byte   subwoofer driver meter (subwoofers only)
-//   0x47  1 byte   system status (01 = ON, 02 = standby) -- SOLE authority
-//   0x81  2 bytes  slow sensor (mirrors temp in steady state)
-//   0x83  2 bytes  slow sensor (mirrors temp in steady state)
-//   0x84  2 bytes  [device class][dynamic metric]
-//                  01 = sub, 02 = two-way, 03 = standby
-//
-// Unknown tags terminate the walk: we cannot know their length, and the
-// spec's TLV stream is forward-compatible, so stopping is safer than
-// guessing.
-// ----------------------------------------------------------------------------
 void on_telemetry_response(const uint8_t *data, size_t len) {
     if (len < 2) return;
-    // Defensive: some callers historically passed a leading busy marker.
-    if (data[0] == 0x06 || data[0] == 0x07) return;
+    if (data[0] == 0x06) return;   // flash write complete
 
     uint8_t target_sess_id = last_polled_sess_id;
     for (int i = 0; i < MAX_SPEAKERS; i++) {
@@ -544,77 +397,30 @@ void on_telemetry_response(const uint8_t *data, size_t len) {
             while (idx < len) {
                 uint8_t tag = data[idx++];
 
-                switch (tag) {
-                    case 0x42:  // input meter (1 byte)
-                        if (idx < len) speaker_registry[i].input_meter = data[idx++];
-                        break;
-
-                    case 0x43:  // HF output meter (1 byte)
-                        if (idx < len) speaker_registry[i].vu_hf = data[idx++];
-                        break;
-
-                    case 0x44:  // midrange output meter (1 byte, three-way only)
-                        if (idx < len) speaker_registry[i].vu_mid = data[idx++];
-                        break;
-
-                    case 0x45:  // LF output meter (1 byte)
-                        if (idx < len) speaker_registry[i].vu_lf = data[idx++];
-                        break;
-
-                    case 0x46:  // subwoofer driver meter (1 byte, subs only)
-                        if (idx < len) speaker_registry[i].vu_sub = data[idx++];
-                        break;
-
-                    case 0x47:  // system status (1 byte) -- SOLE authority on power state
-                        if (idx < len) {
-                            speaker_registry[i].system_status = data[idx++];
-                            if (speaker_registry[i].system_status == 0x02) {
-                                // Standby: audio TLVs are dropped. Force cached
-                                // meters to floor so the display does not freeze
-                                // on the last known level.
-                                speaker_registry[i].input_meter = METER_FLOOR_INPUT;
-                                speaker_registry[i].vu_hf = METER_FLOOR_OUTPUT;
-                                speaker_registry[i].vu_mid = METER_FLOOR_OUTPUT;
-                                speaker_registry[i].vu_lf = METER_FLOOR_OUTPUT;
-                                speaker_registry[i].vu_sub = METER_FLOOR_OUTPUT;
-                            }
-                        }
-                        break;
-
-                    case 0x81:  // 2-byte slow sensor
-                    case 0x83:  // 2-byte slow sensor
-                        idx += 2;
-                        break;
-
-                    case 0x84:  // 2 bytes: [device class][dynamic metric]
-                        if (idx + 1 < len) {
-                            uint8_t cls = data[idx++];
-                            // 0x01 = sub, 0x02 = two-way -> update class.
-                            // 0x03 = standby marker -> do NOT overwrite class.
-                            if (cls == DEVICE_CLASS_SUBWOOFER || cls == DEVICE_CLASS_TWO_WAY) {
-                                speaker_registry[i].device_class = cls;
-                            }
-                            speaker_registry[i].state_flags_dynamic = data[idx++];
-                        } else {
-                            // Truncated frame; abandon walk.
-                            idx = len;
-                        }
-                        break;
-
-                    default:
-                        // Unknown tag -> cannot know its length. Abort walk.
-                        idx = len;
-                        break;
+                if (tag == 0x43 && idx < len) {
+                    speaker_registry[i].vu1 = data[idx++];
+                    if (speaker_registry[i].vu1 > VU_MUSIC_THRESHOLD) {
+                        last_music_ms = bsp_millis();
+                    }
                 }
-            }
-
-            // Music detection for the ISS idle timer: use the merged max(),
-            // evaluated AFTER the full walk so we don't miss LF-only content
-            // that arrives after 0x43 within the same frame. Subwoofers do
-            // not gate ISS idle on a non-sub system.
-            if (speaker_registry[i].device_class != DEVICE_CLASS_SUBWOOFER) {
-                if (merge_output_meters(&speaker_registry[i]) > VU_MUSIC_THRESHOLD) {
-                    last_music_ms = bsp_millis();
+                else if (tag == 0x84 && idx < len) {
+                    speaker_registry[i].play_state = data[idx++];   // 1-byte value
+                }
+                else if (tag == 0x47 && idx < len) {
+                    idx += 1;   // system status, 1 byte
+                }
+                else if (tag == 0x81 || tag == 0x83) {
+                    idx += 2;   // 2-byte value
+                }
+                else if (tag == 0x42 || tag == 0x45) {
+                    idx += 1;   // 1-byte value
+                }
+                else if (tag == 0xB0) {
+                    idx += 2;   // 2-byte value (not used)
+                }
+                else {
+                    // Unknown tag – we can’t know its length, so stop parsing.
+                    break;
                 }
             }
 
@@ -626,15 +432,11 @@ void on_telemetry_response(const uint8_t *data, size_t len) {
 
 
 void on_generic_ack(void) {
-    // The hub just polled last_polled_sess_id. An ACK on address 0x0101
-    // is that speaker confirming receipt. Only reset THAT speaker's
-    // watchdog, not every active speaker: a dead speaker that never
-    // answers must be allowed to accrue missed polls and be evicted.
-    uint8_t target_sess_id = last_polled_sess_id;
+    // Any ACK from any speaker shows the bus is healthy.
+    // Reset the watchdog for all active speakers to avoid false drops.
     for (int i = 0; i < MAX_SPEAKERS; i++) {
-        if (speaker_registry[i].active && speaker_registry[i].sess_id == target_sess_id) {
+        if (speaker_registry[i].active) {
             speaker_registry[i].missed_polls = 0;
-            break;
         }
     }
 }
@@ -736,31 +538,6 @@ void hub_init(void) {
 }
 
 
-// ----------------------------------------------------------------------------
-// Stage 7 eviction helper: burst, then reset the ID cursor.
-// Called with the speaker still marked active so we know its sess_id.
-// ----------------------------------------------------------------------------
-static void evict_speaker(uint8_t idx) {
-    uint8_t dead_id = speaker_registry[idx].sess_id;
-
-    // Rapid retry burst to the dead address, ~9 ms apart, bypassing the
-    // 20 ms TX queue so the timing is tight.
-    for (int b = 0; b < EVICT_RETRY_COUNT; b++) {
-        send_frame_immediate(0x0100 | dead_id, (uint8_t[]){0x08}, 1);
-        uint32_t t0 = bsp_millis();
-        while ((bsp_millis() - t0) < EVICT_RETRY_SPACING_MS) { /* wait */ }
-    }
-
-    speaker_registry[idx].active = false;
-
-    // Restart session ID discovery from dead_id + 1 (spec section 3).
-    // allocate_next_sess_id() will still scan forward for a truly free ID,
-    // so this is a hint, not a source of truth.
-    next_available_sess_id = dead_id + 1;
-    if (next_available_sess_id > 0xFE) next_available_sess_id = 0x02;
-}
-
-
 void hub_main_loop(void) {
     uint32_t now = bsp_millis();
 
@@ -773,19 +550,15 @@ void hub_main_loop(void) {
     // 2. Process TX Queue (20ms pacing)
     process_tx_queue();
 
-    // 3. Real-time Volume Change check (handles sleeping-state wake-up internally)
+    // 3. Real-time Volume Change check (handles standby/ISS idle wake-up internally)
     check_volume_change();
 
-    // 4. State machine (always runs, even while sleeping)
+    // 4. State machine (always runs, even during standby_active)
     uint32_t state_interval;
-    switch (hub_state) {
-        case STATE_STANDALONE_IDLE: state_interval = 1220; break;
-        case STATE_DISCOVERY:       state_interval = 200;  break;
-        case STATE_ISS_IDLE:        state_interval = HEARTBEAT_INTERVAL_MS; break;
-        case STATE_USER_STANDBY:    state_interval = HEARTBEAT_INTERVAL_MS; break;
-        case STATE_ACTIVE_POLLING:
-        default:                    state_interval = 1080; break;
-    }
+    if (hub_state == STATE_STANDALONE_IDLE)      state_interval = 1220;
+    else if (hub_state == STATE_DISCOVERY)       state_interval = 200;
+    else if (hub_state == STATE_ISS_IDLE)        state_interval = HEARTBEAT_INTERVAL_MS;   // 610 ms, OEM cadence
+    else /* STATE_ACTIVE_POLLING */              state_interval = 1080;
 
     if (now - last_state_tick >= state_interval) {
         last_state_tick = now;
@@ -796,12 +569,13 @@ void hub_main_loop(void) {
 
         switch (hub_state) {
             case STATE_STANDALONE_IDLE:
-                // Boot wake: speakers may be in standby from a power loss.
-                // v12: (3A 03 7F, 3A 03 01) x3, no trailing 03 02.
-                for (int i = 0; i < 3; i++) {
-                    send_frame(0x01FF, (uint8_t[]){0x3A, 0x03, 0x7F}, 3);
-                    send_frame(0x01FF, (uint8_t[]){0x3A, 0x03, 0x01}, 3);
+                // In standby, skip the wake-up triggers (7F/01) to avoid waking speakers
+                if (standby_active) {
+                    hub_state = STATE_DISCOVERY;
+                    break;
                 }
+                send_frame(0x01FF, (uint8_t[]){0x3A, 0x03, 0x7F}, 3);
+                send_frame(0x01FF, (uint8_t[]){0x3A, 0x03, 0x01}, 3);
                 send_frame(0x01FF, vol_payload, 4);
                 hub_state = STATE_DISCOVERY;
                 break;
@@ -837,14 +611,13 @@ void hub_main_loop(void) {
             case STATE_ACTIVE_POLLING:
                 send_frame(0x01FF, (uint8_t[]){0xFE}, 1);
                 send_frame(0x01FF, vol_payload, 4);
-                // Stage 6: 0x04 keep-alive, once per cycle, after volume and
-                // before the poll round. Spec section 7.
-                send_frame(0x01FF, (uint8_t[]){0x04}, 1);
 
                 // Configure any speaker that answered an FE after we already left
                 // DISCOVERY (race at wake-up: the first respondent flips us to
                 // ACTIVE_POLLING, the second registers milliseconds later and
                 // would otherwise never receive its config sequence).
+                // Sending the config sequence to a running speaker is proven
+                // safe - it happens on every standby wake.
                 for (int i = 0; i < MAX_SPEAKERS; i++) {
                     if (speaker_registry[i].active && !speaker_registry[i].config_queried) {
                         build_config_sequence(speaker_registry[i].sess_id);
@@ -854,10 +627,10 @@ void hub_main_loop(void) {
                 break;
 
             case STATE_ISS_IDLE:
-            case STATE_USER_STANDBY:
-                // Both sleeping states: heartbeat only, nothing else on the
-                // bus. No polls, no FE probes, no 1FF volume. Only a user
-                // action exits this state (handled in callbacks).
+                // OEM standalone behavior: heartbeat only, nothing else on the
+                // bus. No polls, no FE probes, no 1FF volume. The speakers are
+                // left alone so their own ISS timer can put them in standby.
+                // Only a user action exits this state (handled in callbacks).
                 send_standalone_heartbeat();
                 break;
         }
@@ -868,14 +641,12 @@ void hub_main_loop(void) {
     // standby, and never while muted: the speakers do not ISS-sleep when
     // muted, so the hub must not idle either. Accepted trade-off: if the
     // user mutes and stops the streamer, the hub stays awake until acted on.
-    if (hub_state == STATE_ACTIVE_POLLING && !is_muted) {
-        int32_t iss_delta = (int32_t)(now - last_music_ms);
-        if (iss_delta >= (int32_t)ISS_IDLE_TIMEOUT_MS) {
-            enter_iss_idle();
-        }
+    if (hub_state == STATE_ACTIVE_POLLING && !standby_active && !is_muted &&
+        (now - last_music_ms >= ISS_IDLE_TIMEOUT_MS)) {
+        enter_iss_idle();
     }
 
-    // 5. Telemetry Polling (ACTIVE_POLLING only: never polls while sleeping)
+    // 5. Telemetry Polling (ACTIVE_POLLING only: never polls while in ISS idle)
     if (hub_state == STATE_ACTIVE_POLLING) {
         if (now - last_telemetry_tick >= 200) {
             last_telemetry_tick = now;
@@ -884,19 +655,8 @@ void hub_main_loop(void) {
                 if (speaker_registry[idx].active) {
                     speaker_registry[idx].missed_polls++;
                     if (speaker_registry[idx].missed_polls >= 4) {
-                        // Stage 7: rapid retry burst + ID cursor reset.
-                        evict_speaker(idx);
-
-                        bool still_any_active = false;
-                        for (int j = 0; j < MAX_SPEAKERS; j++) {
-                            if (speaker_registry[j].active) {
-                                still_any_active = true;
-                                break;
-                            }
-                        }
-                        if (!still_any_active) {
-                            hub_state = STATE_DISCOVERY;
-                        }
+                        speaker_registry[idx].active = false;
+                        hub_state = STATE_DISCOVERY;
                         break;
                     } else {
                         last_polled_sess_id = speaker_registry[idx].sess_id;
@@ -909,8 +669,8 @@ void hub_main_loop(void) {
         }
     }
 
-    // 6. OLED Display Update (skip while sleeping)
-    if (!hub_is_sleeping() && now - last_oled_update >= 500) {
+    // 6. OLED Display Update (skip if in standby or ISS idle)
+    if (!standby_active && hub_state != STATE_ISS_IDLE && now - last_oled_update >= 500) {
         last_oled_update = now;
         update_oled_display();
     }

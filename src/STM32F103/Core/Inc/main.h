@@ -1,7 +1,7 @@
 /* USER CODE BEGIN Header */
 
 /* 
- * This file is part of the Homebrew Loudspeaker Manager distribution (https://github.com/robcazzaro/HLM).
+ * This file is part of the Homebrew Loudspeaker Manager distribution (https://github.com/robcazzaro/hlm).
  * Copyright (c) 2026 Rob Cazzaro.
  * 
  * This program is free software: you can redistribute it and/or modify  
@@ -103,8 +103,8 @@ void Error_Handler(void);
 
 /* USER CODE BEGIN Private defines */
 // enable only one of the following to change the app behavior
-#define HLM_HUB         // to compile a simplified replacement of the GLM hub. 
-//#define HLM_HEX_DUMP      // to dump all RS485 traffic as timestamp + hex codes
+//#define HLM_HUB         // to compile a simplified replacement of the GLM hub. 
+#define HLM_HEX_DUMP      // to dump all RS485 traffic as timestamp + hex codes
 //#define HLM_ANALYZER    // prints timestamp + message decoded
 
 // ensure only one is defined

@@ -1,5 +1,5 @@
 /* 
- * This file is part of the Homebrew Loudspeaker Manager distribution (https://github.com/robcazzaro/HLM).
+ * This file is part of the Homebrew Loudspeaker Manager distribution (https://github.com/robcazzaro/hlm).
  * Copyright (c) 2026 Rob Cazzaro.
  * 
  * This program is free software: you can redistribute it and/or modify  
@@ -68,7 +68,7 @@ uint16_t isr_index = 0;
 // Encoder section -------------------------------------------------------------------------
 // ----- User adjustable definitions ----- 
 #define ENCODER_TIMER              TIM2
-#define VOLUME_MIN                 (-1200)
+#define VOLUME_MIN                 (-1204)
 #define VOLUME_MAX                 0
 #define VOLUME_DB_INC              5        // each encoder detent is 0.5dB
 
